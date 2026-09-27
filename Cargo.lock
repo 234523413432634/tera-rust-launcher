@@ -5210,6 +5210,7 @@ dependencies = [
  "prost-types",
  "protobuf",
  "reqwest 0.12.28",
+ "rust-ini",
  "serde",
  "serde_json",
  "tokio",

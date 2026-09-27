@@ -18,7 +18,7 @@ Tera Rust Launcher is a custom game launcher designed for Tera Online. It provid
 - Version tracking via `launcher_version.ini`; compiled version from `tauri.conf.json` is source of truth
 - Update cache management (clear cached state between sessions)
 - Multi-language support (English, French, Russian, German)
-- Custom game path configuration via `config.ini`
+- Runtime configuration via `config.ini`: game path (absolute or `relative`), language, server URL and client version — no rebuild needed to point at another server
 - Hash file generation for game files (`hash-file.json`)
 - Server list integration via configurable `SERVER_LIST_URL`
 - **Linux support**: native Tauri binary (WebKitGTK) + `launcher-bridge.exe` cross-compiled for Wine; Win32 IPC bridged to native launcher via stdin/stdout JSON pipes
@@ -84,17 +84,47 @@ cd tera-rust-launcher
 
 ---
 
-### 2. Configure `teralib/src/config/config.json`
+### 2. Configure `config.ini`
 
-Baked into the binary at compile time. Edit before building:
+The server address and the client version are read at runtime from the
+`config.ini` that ships next to `TeraLauncher.exe`, so one build works against
+any server and against several clients side by side:
+
+```ini
+[game]
+lang=EUR
+path=F:\\Tera\\Tera100
+server_url=192.168.6.129
+client_ver=100.02
+```
+
+| Key | Meaning |
+|---|---|
+| `lang` | Game language (`EUR`, `USA`, `RUS`, `GER`, ...) |
+| `path` | Game folder. `relative` means "the folder the launcher sits in" |
+| `server_url` | Server host. A bare host gets `http://`; `https://host:port` works too |
+| `client_ver` | Client version shown in the launcher |
+
+`path=relative` makes an install portable — a `TeraLauncher.exe` in
+`F:\Tera\Tera100` resolves its game folder to `F:\Tera\Tera100`, so the same
+`config.ini` can be copied into every client folder. A sub-folder also works
+(`path=relative\Client`). Absolute paths keep working unchanged.
+
+#### `teralib/src/config/config.json` — compile-time fallbacks
+
+Only used when a key is missing from `config.ini`. The URL entries are
+templates: `{server}` expands to the resolved `server_url`, so the endpoint
+layout stays configurable without repeating the host.
 
 ```json
 {
-  "LAUNCHER_ACTION_URL": "http://SERVERIP-URI",
-  "HASH_FILE_URL": "http://SERVERIP-URI/public/launcher/hash-file.json",
-  "FILE_SERVER_URL": "http://SERVERIP-URI/public",
-  "SERVER_LIST_URL": "http://SERVERIP-URI/tera/ServerList.json?lang=en&sort=3",
-  "CLIENT_VERSION": "31.04"
+  "SERVER_URL": "http://127.0.0.1",
+  "CLIENT_VERSION": "100.02",
+  "SUPPORT_URL": "",
+  "LAUNCHER_ACTION_URL": "{server}",
+  "HASH_FILE_URL": "{server}/public/launcher/hash-file.json",
+  "FILE_SERVER_URL": "{server}/public",
+  "SERVER_LIST_URL": "{server}/tera/ServerList.json?lang=en&sort=3"
 }
 ```
 
@@ -175,9 +205,12 @@ wineboot --init
 ```
 
 Point `config.ini` at your Tera installation inside the Wine prefix, e.g.:
-```
-[CONFIG]
-game_path=~/.tera-wine/drive_c/Tera/Client/Binaries/TERA.exe
+```ini
+[game]
+lang=EUR
+path=/home/you/.tera-wine/drive_c/Tera/Client
+server_url=192.168.6.129
+client_ver=100.02
 ```
 
 Run the launcher:
@@ -196,8 +229,15 @@ Place the following files in the same directory as `TeraLauncher.exe`:
 TeraLauncher.exe
 autoupdater.exe       ← downloaded automatically at startup, or place manually
 launcher_version.ini  ← auto-created on first run from compiled version
-config.ini            ← game path and language settings (auto-created on first run)
+config.ini            ← game path, language, server URL and client version
+                        (auto-created with path=relative on first run)
 ```
+
+Running several clients side by side (`F:\Tera\Tera100`, `F:\Tera\Tera71`, ...)
+just means one such folder each, every one with its own `config.ini`. The
+launchers share a single WebView profile, so the one you start second notices
+that the stored session came from another folder and returns you to the login
+screen rather than restoring a session it cannot actually launch the game with.
 
 ---
 

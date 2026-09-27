@@ -165,9 +165,24 @@ const App = {
       this.initializeLoadingModalElements();
       this.setupModalButtonEventHandlers();
       await this.updateLanguageSelector();
+      // Must run before the first navigation: it may drop a session that
+      // belongs to a launcher in another folder, which decides login vs home.
+      const sessionDropped = await this.enforceLauncherFolderSession();
       this.Router.setupEventListeners();
       await this.Router.navigate();
-      await this.sendStoredAuthInfoToBackend(); // WAIT for auth sync before checking connection
+      // Storage reads can come back empty this early in the page's life, so the
+      // clear above may have run against an area that had not loaded yet. By
+      // now it has: if the dropped session is still readable, drop it again and
+      // leave the home page it let us onto.
+      if (sessionDropped && localStorage.getItem("authKey")) {
+        console.warn("Stored session survived the first clear; clearing again.");
+        this.clearStoredAuthInfo();
+        this.checkAuthentication();
+        await this.Router.navigate("login");
+      }
+      if (!sessionDropped) {
+        await this.sendStoredAuthInfoToBackend(); // WAIT for auth sync before checking connection
+      }
       this.setupMutationObserver();
 
       this.checkAuthentication();
@@ -1538,14 +1553,7 @@ const App = {
     this.setState({ isLoggingOut: true });
     try {
       await invoke("handle_logout");
-      localStorage.removeItem("authKey");
-      localStorage.removeItem("userName");
-      localStorage.removeItem("userNo");
-      localStorage.removeItem("characterCount");
-      localStorage.removeItem("permission");
-      localStorage.removeItem("privilege");
-      localStorage.removeItem("banned");
-      localStorage.removeItem("sessionCookie");
+      this.clearStoredAuthInfo();
 
       const generateHashFileBtn = document.getElementById("generate-hash-file");
       if (generateHashFileBtn) {
@@ -1565,6 +1573,70 @@ const App = {
     } finally {
       this.setState({ isLoggingOut: false });
     }
+  },
+
+  /**
+   * Removes every locally stored piece of the authenticated session.
+   */
+  clearStoredAuthInfo() {
+    [
+      "authKey",
+      "userName",
+      "userNo",
+      "characterCount",
+      "permission",
+      "privilege",
+      "banned",
+      "sessionCookie",
+    ].forEach((key) => localStorage.removeItem(key));
+  },
+
+  /**
+   * Signs the user out when this launcher runs from a different folder than the
+   * one that last used the shared session.
+   *
+   * Several installs (F:\Tera\Tera100, F:\Tera\Tera71, ...) share a single
+   * WebView profile, so localStorage — and with it the auth key — is shared
+   * between them. A second launcher would therefore start already "logged in"
+   * while its own backend process has none of the per-login state that
+   * launching the game needs (ACTS_MAP / PAGES_MAP / the authenticated HTTP
+   * client), leaving the play button broken until a manual sign-out and
+   * sign-in. Forcing the login screen makes that round trip automatic.
+   *
+   * Which install owns the session is tracked by the backend in a marker file,
+   * not here: web storage reads return empty this early in the page's life, so
+   * a value written by the previous run is not readable when the check runs.
+   *
+   * The sign-out is local only: the server session is left intact so a launcher
+   * still running in the other folder is not kicked.
+   *
+   * @returns {Promise<boolean>} Whether a stored session was dropped.
+   */
+  async enforceLauncherFolderSession() {
+    let ownershipChanged;
+    try {
+      ownershipChanged = await invoke("claim_session_ownership");
+    } catch (error) {
+      console.warn("Could not claim the launcher session:", error);
+      return false;
+    }
+
+    if (!ownershipChanged) return false;
+
+    console.log("Launcher folder changed since the last session; signing out.");
+
+    this.clearStoredAuthInfo();
+    // The new folder is a different install: let it re-verify its own
+    // config.ini instead of inheriting the other one's "already set up" flag.
+    localStorage.removeItem("isFirstLaunch");
+    this.setState({
+      updateCheckPerformed: false,
+      updateCheckPerformedOnLogin: false,
+      updateCheckPerformedOnRefresh: false,
+    });
+    this.checkAuthentication();
+
+    return true;
   },
 
   /**

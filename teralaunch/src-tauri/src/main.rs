@@ -397,7 +397,7 @@ async fn get_server_hash_file() -> Result<serde_json::Value, String> {
   
   let json: serde_json::Value = res.json().await.map_err(|e| {
     let error_msg = format!("Failed to parse hash file JSON: {} (URL: {})", e, url);
-    let _ = log_error_to_file(&error_msg);
+    //let _ = log_error_to_file(&error_msg);
     error_msg
   })?;
   Ok(json)
@@ -457,63 +457,43 @@ fn get_hash_file_url() -> String {
 }
 
 fn find_config_file() -> Option<PathBuf> {
-  // Prefer config.ini next to the executable — stable regardless of cwd
-  if let Ok(exe_path) = env::current_exe() {
-    if let Some(exe_dir) = exe_path.parent() {
-      let config_in_exe_dir = exe_dir.join("config.ini");
-      if config_in_exe_dir.exists() {
-        return Some(config_in_exe_dir);
-      }
-    }
-  }
-
-  let current_dir = env::current_dir().ok()?;
-  let config_in_current = current_dir.join("config.ini");
-  if config_in_current.exists() {
-    return Some(config_in_current);
-  }
-
-  let parent_dir = current_dir.parent()?;
-  let config_in_parent = parent_dir.join("config.ini");
-  if config_in_parent.exists() {
-    return Some(config_in_parent);
-  }
-
-  None
+  // Discovery lives in teralib so the launcher and the library agree on which
+  // config.ini a given TeraLauncher.exe belongs to.
+  teralib::config::find_config_file()
 }
 
 /// Get the default configuration file path (in the launcher directory)
 fn get_default_config_path() -> Result<PathBuf, String> {
   let exe_path = env::current_exe()
     .map_err(|e| format!("Failed to get launcher directory: {}", e))?;
-  
+
   let exe_dir = exe_path.parent()
     .ok_or("Failed to get launcher parent directory")?;
-  
+
   Ok(exe_dir.join("config.ini"))
 }
 
-/// Create a default config file if it doesn't exist
+/// Create a default config file if it doesn't exist.
+///
+/// The generated file uses `path=relative`, so the launcher treats its own
+/// folder as the game folder, and carries the server/client settings that used
+/// to be baked into the binary.
 fn create_default_config(config_path: &PathBuf) -> Result<(), String> {
-  let exe_path = env::current_exe()
-    .map_err(|e| format!("Failed to get launcher directory: {}", e))?;
-  
-  let exe_dir = exe_path.parent()
-    .ok_or("Failed to get launcher parent directory")?;
-  
   let mut conf = Ini::new();
   conf.with_section(Some("game"))
     .set("lang", "EUR")
-    .set("path", exe_dir.to_str().ok_or("Invalid launcher path")?);
+    .set("path", teralib::config::RELATIVE_PATH_MARKER)
+    .set("server_url", teralib::config::server_url())
+    .set("client_ver", teralib::config::client_version());
 
   let mut file = File::create(&config_path)
     .map_err(|e| format!("Failed to create config file: {}", e))?;
 
   conf.write_to(&mut file)
     .map_err(|e| format!("Failed to write config: {}", e))?;
-  
+
   info!("Created default config.ini at {:?}", config_path);
-  
+
   Ok(())
 }
 
@@ -534,9 +514,12 @@ fn load_config() -> Result<(PathBuf, String), String> {
 
   let section = conf.section(Some("game")).ok_or("Game section not found in config")?;
 
-  let game_path = section.get("path").ok_or("Game path not found in config")?;
+  let raw_game_path = section.get("path").ok_or("Game path not found in config")?;
 
-  let game_path = PathBuf::from(game_path);
+  // `path=relative` (or any relative value) is resolved against the folder
+  // holding config.ini, which is the launcher's own folder.
+  let config_dir = config_path.parent().ok_or("Failed to get config directory")?;
+  let game_path = teralib::config::resolve_game_path(raw_game_path, config_dir);
 
   let game_lang = section.get("lang").ok_or("Game language not found in config")?.to_string();
 
@@ -809,7 +792,26 @@ fn save_game_path_to_config(path: String) -> Result<(), String> {
     format!("Failed to load config: {}", e)
   )?;
 
-  conf.with_section(Some("game")).set("path", &path);
+  // A config that already says `path=relative` keeps saying so when the user
+  // re-picks the folder it resolves to, otherwise a trip through the settings
+  // dialog would silently pin a portable install to one absolute path.
+  let config_dir = config_path.parent().ok_or("Failed to get config directory")?;
+  let stays_relative = conf
+    .section(Some("game"))
+    .and_then(|section| section.get("path"))
+    .map(|current| {
+      current.trim().eq_ignore_ascii_case(teralib::config::RELATIVE_PATH_MARKER)
+        && teralib::config::resolve_game_path(&path, config_dir) == config_dir
+    })
+    .unwrap_or(false);
+
+  let value = if stays_relative {
+    teralib::config::RELATIVE_PATH_MARKER
+  } else {
+    path.as_str()
+  };
+
+  conf.with_section(Some("game")).set("path", value);
 
   conf.write_to_file(&config_path).map_err(|e| format!("Failed to write config: {}", e))?;
 
@@ -1903,6 +1905,17 @@ async fn handle_logout(state: tauri::State<'_, GameState>) -> Result<(), String>
   }
 
   // Step 2: Reset global authentication information locally
+  reset_local_auth_state().await;
+
+  Ok(())
+}
+
+/// Drops every trace of the signed-in session held by this process: auth info,
+/// the ACTS/PAGES maps and the authenticated HTTP client.
+///
+/// The server session is deliberately left alone — callers that also want it
+/// revoked go through `handle_logout`.
+async fn reset_local_auth_state() {
   {
     let mut auth_info = GLOBAL_AUTH_INFO.write().unwrap();
     auth_info.auth_key = String::new();
@@ -1918,15 +1931,93 @@ async fn handle_logout(state: tauri::State<'_, GameState>) -> Result<(), String>
   }
 
   {
-    let mut pages_map = GLOBAL_ACTS_MAP.write().unwrap();
-    pages_map.clear();
+    let mut acts_map = GLOBAL_ACTS_MAP.write().unwrap();
+    acts_map.clear();
     info!("GLOBAL_ACTS_MAP cleared.");
   }
 
   let mut client_guard = AUTHENTICATED_CLIENT.lock().await;
   *client_guard = None;
+}
 
-  Ok(())
+/// Path of the marker recording which install last used the shared session.
+///
+/// It lives in the app's local data directory — the same folder that holds the
+/// `EBWebView` profile every install shares — so all launchers, wherever they
+/// are installed, read and write the one marker.
+fn session_owner_marker(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let dir = app
+    .path_resolver()
+    .app_local_data_dir()
+    .ok_or("Failed to resolve the launcher data directory")?;
+
+  fs::create_dir_all(&dir)
+    .map_err(|e| format!("Failed to create the launcher data directory: {}", e))?;
+
+  Ok(dir.join("session_owner.txt"))
+}
+
+/// Records this install as the owner of the shared launcher session and reports
+/// whether ownership just moved from a different folder.
+///
+/// Every install shares one WebView profile, so the stored login — auth key
+/// included — is shared between `F:\Tera\Tera100`, `F:\Tera\Tera71` and so on,
+/// while the per-login state that launching the game needs (ACTS_MAP /
+/// PAGES_MAP / the authenticated HTTP client) lives only in the process that
+/// performed the login. A second launcher would therefore start already
+/// "logged in" with a play button that cannot work until a manual sign-out and
+/// sign-in. Returning `true` tells the frontend to drop the stored session and
+/// show the login screen instead.
+///
+/// The marker is a file rather than a `localStorage` key on purpose: reads of
+/// the shared web storage come back empty this early in the page's life, so a
+/// value written by the previous run is not visible when the check has to run.
+///
+/// The session is only dropped locally — `LogoutAction` is deliberately not
+/// called, so a launcher still running in the other folder is not kicked.
+#[tauri::command]
+async fn claim_session_ownership(
+  app: tauri::AppHandle,
+  state: tauri::State<'_, GameState>
+) -> Result<bool, String> {
+  let launcher_dir = teralib::config::launcher_dir()
+    .ok_or("Failed to determine launcher directory")?;
+  let current = launcher_dir.to_string_lossy().to_string();
+
+  let marker = session_owner_marker(&app)?;
+  let previous = fs::read_to_string(&marker)
+    .ok()
+    .map(|owner| owner.trim().to_string())
+    .filter(|owner| !owner.is_empty());
+
+  fs::write(&marker, &current)
+    .map_err(|e| format!("Failed to record the session owner: {}", e))?;
+
+  // No marker yet (first run after updating) is not a change: there is no other
+  // install's session to drop.
+  let changed = match &previous {
+    // Windows paths are case-insensitive, so the same folder must not look new.
+    Some(previous) => !previous.eq_ignore_ascii_case(&current),
+    None => false,
+  };
+
+  if changed {
+    info!(
+      "Shared session ownership moved from {:?} to {:?} — signing out locally.",
+      previous.unwrap_or_default(),
+      current
+    );
+
+    {
+      let mut is_launching = state.is_launching.lock().await;
+      *is_launching = false;
+    }
+    reset_local_auth_state().await;
+  } else {
+    info!("Shared session owner is {:?}.", current);
+  }
+
+  Ok(changed)
 }
 
 // Modification: We need to access LAUNCHER_BASE_URL inside this function,
@@ -3073,6 +3164,7 @@ fn main() {
         get_files_to_update_force,
         update_file,
         handle_logout,
+        claim_session_ownership,
         generate_hash_file,
         check_server_connection,
         check_update_required,
